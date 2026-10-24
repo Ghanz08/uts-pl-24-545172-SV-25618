@@ -1,0 +1,137 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main, dev, "feature/**"]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-test:
+    name: Backend test (php artisan test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: "8.4"
+          extensions: pdo_sqlite, mbstring, intl
+          coverage: none
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: backend/vendor
+          key: composer-${{ hashFiles('backend/composer.lock') }}
+
+      - run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Prepare testing env
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      # phpunit.xml switches the database to in-memory SQLite.
+      - run: php artisan test
+
+  frontend-build:
+    name: Frontend build (npm ci && npm run build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run build
+        env:
+          VITE_API_URL: /api
+
+  deploy:
+    name: Deploy images to GHCR
+    # Only a push to main deploys. PRs, dev and feature branches stop after test + build.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [backend-test, frontend-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image names (GHCR needs lowercase)
+        run: |
+          prefix="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "BACKEND_IMAGE=${prefix}-backend" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=${prefix}-frontend" >> "$GITHUB_ENV"
+
+      # Secrets come from Settings → Secrets and variables → Actions, never from the repo.
+      - name: Write .env from GitHub Secrets
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          test -n "$APP_KEY" || { echo "::error::Secret APP_KEY belum diset"; exit 1; }
+          test -n "$DB_PASSWORD" || { echo "::error::Secret DB_PASSWORD belum diset"; exit 1; }
+          {
+            echo "APP_KEY=$APP_KEY"
+            echo "DB_PASSWORD=$DB_PASSWORD"
+            echo "DB_ROOT_PASSWORD=$DB_PASSWORD"
+          } > .env
+
+      - name: Build images and start the stack
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Smoke test (Vue → Nginx → Laravel/FrankenPHP → MySQL)
+        run: |
+          code=$(curl -s -o /tmp/login.json -w '%{http_code}' -X POST http://localhost:8080/api/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"demo@ideavault.test","password":"password123"}')
+          echo "login -> $code"; test "$code" = 200
+          token=$(jq -r .token /tmp/login.json)
+          curl -sf http://localhost:8080/api/project-ideas -H "Authorization: Bearer $token" | jq '.data | length'
+          docker compose logs backend | grep -i -m1 'http.log.access' || true
+
+      - name: Show stack status
+        if: always()
+        run: docker compose ps
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag with commit SHA and push
+        run: |
+          docker tag ideavault-backend:local  "$BACKEND_IMAGE:${GITHUB_SHA}"
+          docker tag ideavault-frontend:local "$FRONTEND_IMAGE:${GITHUB_SHA}"
+          docker push "$BACKEND_IMAGE:${GITHUB_SHA}"
+          docker push "$FRONTEND_IMAGE:${GITHUB_SHA}"
+          {
+            echo "### Images pushed"
+            echo "- \`$BACKEND_IMAGE:${GITHUB_SHA}\`"
+            echo "- \`$FRONTEND_IMAGE:${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
