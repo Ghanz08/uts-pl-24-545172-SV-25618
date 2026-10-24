@@ -1,0 +1,23 @@
+{
+	{$CADDY_GLOBAL_OPTIONS}
+	# Plain HTTP inside the Compose network; the frontend's Nginx sits in front.
+	auto_https off
+
+	frankenphp {
+		{$FRANKENPHP_CONFIG}
+	}
+}
+
+{$SERVER_NAME::8000} {
+	root * /app/public
+	encode zstd br gzip
+
+	# Access log to stdout: every API request shows up in `docker compose logs backend`
+	# tagged with the FrankenPHP/Caddy logger — proof that FrankenPHP serves the API.
+	log {
+		output stdout
+		format console
+	}
+
+	php_server
+}
